@@ -1,207 +1,228 @@
-# this should be at the top with the other import statements
 import serial
+import time
+import weewx
+import weeutil.weeutil
+from typing import Optional, Dict, Any, Union
+from dataclasses import dataclass
+from enum import Enum
 
-# this new class should probably live underneath the CWOP class
-#
-#===============================================================================
-#                             class APRS
-#===============================================================================
+class APRSError(Exception):
+    """Custom exception for APRS-related errors."""
+    pass
 
-class APRS(REST):
-    """Upload using the APRS protocol. """
+class SerialConfig:
+    """Handles serial port configuration validation."""
+    VALID_PARITIES = {'N', 'E', 'O', 'M', 'S'}
+    
+    @staticmethod
+    def validate_parity(parity: str) -> str:
+        parity = parity.upper()
+        if parity not in SerialConfig.VALID_PARITIES:
+            raise ValueError(f"Invalid parity value. Must be one of {SerialConfig.VALID_PARITIES}")
+        return parity
 
-    def __init__(self, site, **kwargs):
-        """Initialize for a post to APRS.
+class APRSStatus(Enum):
+    """Enum for APRS status codes."""
+    DISABLED = "Disabled"
+    STALE = "Stale"
+    INTERVAL_WAIT = "Interval Wait"
+    NON_LATEST = "Non Latest Record"
+    INVALID_UNITS = "Invalid Units"
+    SUCCESS = "Success"
+
+@dataclass
+class APRSConfig:
+    """Configuration data class for APRS settings."""
+    station: str
+    latitude: float
+    longitude: float
+    hardware: str
+    port: str
+    baudrate: int
+    databits: int
+    parity: str
+    stopbits: int
+    unproto: str
+    status_message: str
+    enabled: bool
+    interval: int = 0
+    stale: int = 1800
+    max_tries: int = 3
+
+    def __post_init__(self):
+        """Validate configuration after initialization."""
+        self.station = self.station.upper()
+        self.parity = SerialConfig.validate_parity(self.parity)
         
-        site: The upload site ("APRS")
+        if not -90 <= self.latitude <= 90:
+            raise ValueError("Latitude must be between -90 and 90 degrees")
+        if not -180 <= self.longitude <= 180:
+            raise ValueError("Longitude must be between -180 and 180 degrees")
+        if self.interval < 0:
+            raise ValueError("Interval cannot be negative")
+        if self.stale < 0:
+            raise ValueError("Stale threshold cannot be negative")
+        if self.max_tries < 1:
+            raise ValueError("Max tries must be at least 1")
+
+class APRS:
+    """Upload weather data using the APRS protocol."""
+
+    def __init__(self, site: str, **kwargs):
+        """Initialize APRS uploader with configuration."""
+        self.site = site
+        self.config = APRSConfig(
+            station=kwargs['station'],
+            latitude=float(kwargs['latitude']),
+            longitude=float(kwargs['longitude']),
+            hardware=kwargs['hardware'],
+            port=kwargs['port'],
+            baudrate=int(kwargs['baudrate']),
+            databits=int(kwargs['databits']),
+            parity=kwargs['parity'],
+            stopbits=int(kwargs['stopbits']),
+            unproto=kwargs['unproto'],
+            status_message=kwargs['status_message'],
+            enabled=bool(int(kwargs['enabled'])),
+            interval=int(kwargs.get('interval', 0)),
+            stale=int(kwargs.get('stale', 1800)),
+            max_tries=int(kwargs.get('max_tries', 3))
+        )
+        self._lastpost: Optional[int] = None
         
-        port: Serial port to which the TNC is connected.
+    def _check_post_conditions(self, archive: Any, time_ts: int) -> APRSStatus:
+        """Check if conditions are met for posting data."""
+        if not self.config.enabled:
+            return APRSStatus.DISABLED
 
-        baudrate: Serial port baudrate setting
+        last_ts = archive.lastGoodStamp()
+        if time_ts != last_ts:
+            return APRSStatus.NON_LATEST
 
-        databits: Serial port databits setting
+        how_old = time.time() - time_ts
+        if how_old > self.config.stale:
+            return APRSStatus.STALE
 
-        parity: Serial port parity setting
+        if self._lastpost and time_ts - self._lastpost < self.config.interval:
+            return APRSStatus.INTERVAL_WAIT
 
-        stopbits: Serial port stopbits steting
+        return APRSStatus.SUCCESS
 
-        unproto: the UNPROTO setting for the TNC (e.g., "aprs via wide2-2")
-
-        status_message: Any status message that should be included in an additional packet
-        without location or time.
-
-        enabled: any value less than 1 will disable APRS packet transmissions.
-
-        station: The name of the station (e.g., "CW1234") as a string [Required]
-        
-        latitude: Station latitude [Required]
-        
-        longitude: Station longitude [Required]
-
-        hardware: Station hardware (eg, "VantagePro") [Required]
-        
-        interval: The interval in seconds between posts [Optional. 
-        Default is 0 (send every post)]
-        
-        stale: How old a record can be before it will not be 
-        used for a catchup [Optional. Default is 1800]
-        
-        max_tries: Max # of tries before giving up [Optional. Default is 3]
-
-        APRS does not like heavy traffic on their servers, so they encourage
-        posts roughly every 15 minutes and at most every 5 minutes. So,
-        key 'interval' should be set to no less than 300, but preferably 900.
-        Setting it to zero will cause every archive record to be posted.
-        """
-        self.site      = site
-        self.port      = kwargs['port']
-        self.baudrate  = int(kwargs['baudrate'])
-        self.databits  = int(kwargs['databits'])
-        self.parity    = kwargs['parity']
-        self.stopbits  = int(kwargs['stopbits'])
-        self.station   = kwargs['station'].upper()
-        self.unproto   = kwargs['unproto']
-        self.status_message   = kwargs['status_message']
-        self.enabled   = int(kwargs['enabled'])
-        self.latitude  = float(kwargs['latitude'])
-        self.longitude = float(kwargs['longitude'])
-        self.hardware  = kwargs['hardware']
-        self.interval  = int(kwargs.get('interval', 0))
-        self.stale     = int(kwargs.get('stale', 1800))
-        self.max_tries = int(kwargs.get('max_tries', 3))
-        
-        self._lastpost = None
-        
-    def postData(self, archive, time_ts):
-        """Post data to APRS, using the APRS protocol."""
-        
-        _last_ts = archive.lastGoodStamp()
-
-        # There are a variety of reasons to skip a post to APRS.
-
-        # APRS is turned off in config
-        if self.enabled == 0:
-            raise SkippedPost, "APRS: Turned off in configuration. (enabled = 0)"
-
-        # 1. They do not allow backfilling, so there is no reason
-        # to post anything other than the latest record:
-        if time_ts != _last_ts:
-            raise SkippedPost, "APRS: Record %s is not last record" %\
-                    (weeutil.weeutil.timestamp_to_string(time_ts), )
-
-        # 2. No reason to post an old out-of-date record.
-        _how_old = time.time() - time_ts
-        if _how_old > self.stale:
-            raise SkippedPost, "APRS: Record %s is stale (%d > %d)." %\
-                    (weeutil.weeutil.timestamp_to_string(time_ts), _how_old, self.stale)
-        
-        # 3. Finally, we don't want to post more often than the interval
-        if self._lastpost and time_ts - self._lastpost < self.interval:
-            raise SkippedPost, "APRS: Wait interval (%d) has not passed." %\
-                    (self.interval, )
-        
-        # Get the data record for this time:
-        _record = self.extractRecordFrom(archive, time_ts)
-
-        # 4. Units must be US Customary. We could add code to convert, but for
-        # now this will do:
-        if _record['usUnits'] != weewx.US:
-            raise SkippedPost, "APRS: Units must be US Customary."
-        
-        # Get the login and packet strings:
-        _tnc_packet = self.getTNCPacket(_record)
-
-        # Send packet to serial port
-        _ser = serial.Serial(self.port)
-        _ser.baudrate = self.baudrate
-        _ser.bytesize = self.databits
-        _ser.parity = self.parity
-        _ser.stopbits = self.stopbits
-        _ser.flushOutput()
-        _ser.flushInput()
-        # put the tnc in command mode, equivalent to ctrl-C
-        _ser.write("\x03")
-        time.sleep(1)
-        _ser.write("mycall " + self.station + "\r")
-        time.sleep(1)
-        _ser.write("unproto " + self.unproto + "\r")
-        time.sleep(1)
-        _ser.write("conv\r")
-        time.sleep(1)
-        _ser.write(_tnc_packet + "\r")
-        time.sleep(1)
-        _ser.write(">" + self.status_message + "\r")
-        _ser.write("\x03")
-        _ser.flushInput()
-        _ser.flushOutput()
+    def _send_tnc_commands(self, ser: serial.Serial, packet: str) -> None:
+        """Send commands to TNC with proper timing and error handling."""
+        commands = [
+            ("\x03", 1),  # ctrl-C
+            (f"mycall {self.config.station}\r", 1),
+            (f"unproto {self.config.unproto}\r", 1),
+            ("conv\r", 1),
+            (f"{packet}\r", 1),
+            (f">{self.config.status_message}\r", 1),
+            ("\x03", 0)
+        ]
 
         try:
-            _ser.close()
-        except:
-            pass
+            for cmd, delay in commands:
+                ser.write(cmd.encode())
+                if delay:
+                    time.sleep(delay)
+        except serial.SerialException as e:
+            raise APRSError(f"Failed to send TNC commands: {str(e)}")
 
-        self._lastpost = time_ts
-        
-
-    def getTNCPacket(self, record):
-        """Form the TNC2 packet used by APRS."""
-        
-        # TODO: Allow native metric units. Convert as necessary for APRS.
-        
-        # Time:
+    def format_weather_data(self, record: Dict[str, Any]) -> str:
+        """Format weather data according to APRS protocol specifications."""
         time_tt = time.gmtime(record['dateTime'])
         time_str = time.strftime("@%d%H%Mz", time_tt)
 
-        # Position:
-        lat_str = weeutil.weeutil.latlon_string(self.latitude, ('N', 'S'), 'lat')
-        lon_str = weeutil.weeutil.latlon_string(self.longitude, ('E', 'W'), 'lon')
-        latlon_str = '%s%s%s/%s%s%s' % (lat_str + lon_str)
+        # Position formatting
+        lat_str = weeutil.weeutil.latlon_string(self.config.latitude, ('N', 'S'), 'lat')
+        lon_str = weeutil.weeutil.latlon_string(self.config.longitude, ('E', 'W'), 'lon')
+        latlon_str = f"{lat_str}{lon_str}"
 
-        # Wind and temperature
-        wt_list = []
-        for obs_type in ('windDir', 'windSpeed', 'windGust', 'outTemp'):
-            wt_list.append("%03d" % record[obs_type] if record[obs_type] is not None else '...')
-        wt_str = "_%s/%sg%st%s" % tuple(wt_list)
-
-        # Rain
-        rain_list = []
-        for obs_type in ('rain', 'rain24', 'dailyrain'):
-            rain_list.append("%03d" % (record[obs_type]*100.0) if record[obs_type] is not None else '...')
-        rain_str = "r%sp%sP%s" % tuple(rain_list)
+        # Weather metrics formatting
+        wind_temp = self._format_wind_temp(record)
+        rain = self._format_rain(record)
+        baro = self._format_barometer(record)
+        humidity = self._format_humidity(record)
+        radiation = self._format_radiation(record)
         
-        # Barometer:
-        if record['barometer'] is None:
-            baro_str = "b....."
-        else:
-            # Figure out what unit type barometric pressure is in for this record:
-            (u, g) = weewx.units.getStandardUnitType(record['usUnits'], 'barometer')
-            # Convert to millibars:
-            baro = weewx.units.convert((record['barometer'], u, g), 'mbar')
-            baro_str = "b%5d" % (baro[0]*10.0)
+        # Hardware identifier
+        hardware_str = ".DsVP" if self.config.hardware == "VantagePro" else ".Unkn"
 
-        # Humidity:
-        humidity = record['outHumidity']
+        return f"{time_str}{latlon_str}{wind_temp}{rain}{baro}{humidity}{radiation}{hardware_str}"
+
+    def _format_wind_temp(self, record: Dict[str, Any]) -> str:
+        """Format wind and temperature data."""
+        values = []
+        for field in ('windDir', 'windSpeed', 'windGust', 'outTemp'):
+            val = record.get(field)
+            values.append(f"{int(val):03d}" if val is not None else "...")
+        return f"_{values[0]}/{values[1]}g{values[2]}t{values[3]}"
+
+    def _format_rain(self, record: Dict[str, Any]) -> str:
+        """Format rain data."""
+        values = []
+        for field in ('rain', 'rain24', 'dailyrain'):
+            val = record.get(field)
+            values.append(f"{int(val * 100):03d}" if val is not None else "...")
+        return f"r{values[0]}p{values[1]}P{values[2]}"
+
+    def _format_barometer(self, record: Dict[str, Any]) -> str:
+        """Format barometer data."""
+        baro = record.get('barometer')
+        if baro is None:
+            return "b....."
+        
+        unit_type = weewx.units.getStandardUnitType(record['usUnits'], 'barometer')
+        baro_mbar = weewx.units.convert((baro, unit_type[0], unit_type[1]), 'mbar')
+        return f"b{int(baro_mbar[0] * 10):05d}"
+
+    def _format_humidity(self, record: Dict[str, Any]) -> str:
+        """Format humidity data."""
+        humidity = record.get('outHumidity')
         if humidity is None:
-            humid_str = "h.."
-        else:
-            humid_str = ("h%2d" % humidity) if humidity < 100.0 else "h00"
-            
-        # Radiation:
-        radiation = record['radiation']
+            return "h.."
+        return f"h{int(humidity):02d}" if humidity < 100.0 else "h00"
+
+    def _format_radiation(self, record: Dict[str, Any]) -> str:
+        """Format radiation data."""
+        radiation = record.get('radiation')
         if radiation is None:
-            radiation_str = ""
-        elif radiation < 1000.0:
-            radiation_str = "L%03d" % radiation
-        elif radiation < 2000.0:
-            radiation_str = "l%03d" % (radiation - 1000)
-        else:
-            radiation_str = ""
+            return ""
+        if radiation < 1000.0:
+            return f"L{int(radiation):03d}"
+        if radiation < 2000.0:
+            return f"l{int(radiation - 1000):03d}"
+        return ""
 
-        # Station hardware:
-        hardware_str = ".DsVP" if self.hardware=="VantagePro" else ".Unkn"
+    def postData(self, archive: Any, time_ts: int) -> None:
+        """Post weather data to APRS network."""
+        status = self._check_post_conditions(archive, time_ts)
         
-        tnc_packet = time_str + latlon_str + wt_str + rain_str +\
-                     baro_str + humid_str + radiation_str + hardware_str
+        if status != APRSStatus.SUCCESS:
+            raise "APRS: {status.value}"
 
-        return tnc_packet
+        record = self.extractRecordFrom(archive, time_ts)
+        
+        if record['usUnits'] != weewx.US:
+            raise "APRS: Units must be US Customary."
 
+        packet = self.format_weather_data(record)
+
+        try:
+            with serial.Serial(
+                port=self.config.port,
+                baudrate=self.config.baudrate,
+                bytesize=self.config.databits,
+                parity=self.config.parity,
+                stopbits=self.config.stopbits
+            ) as ser:
+                ser.flushOutput()
+                ser.flushInput()
+                self._send_tnc_commands(ser, packet)
+                
+        except serial.SerialException as e:
+            raise APRSError(f"Serial communication error: {str(e)}")
+        except Exception as e:
+            raise APRSError(f"Unexpected error during APRS upload: {str(e)}")
+
+        self._lastpost = time_ts
